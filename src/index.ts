@@ -39,14 +39,56 @@ import { startSyncGitHubJob } from "./jobs/syncGitHub.job";
 import { startSyncCodingJob } from "./jobs/syncCoding.job";
 
 // Middleware
-import {
-  globalLimiter,
-} from "./middleware/rateLimit.middleware";
+import { globalLimiter } from "./middleware/rateLimit.middleware";
+
+// ─────────────────────────────────────────────────────────────
+// CORS config — defined ONCE and reused everywhere
+// ─────────────────────────────────────────────────────────────
+const allowedOrigins = [
+  "https://utpt-arivana.netlify.app", // hardcode your Netlify URL
+];
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, server-to-server)
+    if (!origin) return callback(null, true);
+
+    const isAllowed =
+      allowedOrigins.includes(origin) ||
+      origin.includes("localhost") ||
+      origin.includes("netlify.app") ||
+      origin.includes("onrender.com") ||
+      origin.includes("replit.dev") ||
+      origin.includes("replit.app") ||
+      (!!ENV.FRONTEND_URL && origin === ENV.FRONTEND_URL);
+
+    if (isAllowed) {
+      return callback(null, true);
+    }
+
+    console.error("❌ CORS blocked:", origin);
+    return callback(new Error(`CORS blocked: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 200, // Some browsers (IE11) choke on 204
+};
 
 const app = express();
 const server = http.createServer(app);
 
 app.set("trust proxy", 1);
+
+// ─────────────────────────────────────────────────────────────
+// CORS must be the FIRST middleware — before everything else
+// The OPTIONS preflight must be handled before helmet, morgan, etc.
+// ─────────────────────────────────────────────────────────────
+app.use(cors(corsOptions));
+
+// Handle preflight for ALL routes explicitly
+// "*" not "*splat" — that was the bug
+app.options("*", cors(corsOptions));
 
 // ─────────────────────────────────────────────────────────────
 // Socket.IO
@@ -56,18 +98,18 @@ const io = new Server(server, {
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
 
-      if (
-        origin.includes("localhost") ||
-        origin.includes("netlify.app") ||
-        origin.includes("onrender.com") ||
-        origin.includes("replit.dev") ||
-        origin.includes("replit.app") ||
-        (ENV.FRONTEND_URL && origin === ENV.FRONTEND_URL)
-      ) {
-        return cb(null, true);
-      }
+      const isAllowed =
+        allowedOrigins.includes(origin!) ||
+        origin!.includes("localhost") ||
+        origin!.includes("netlify.app") ||
+        origin!.includes("onrender.com") ||
+        origin!.includes("replit.dev") ||
+        origin!.includes("replit.app") ||
+        (!!ENV.FRONTEND_URL && origin === ENV.FRONTEND_URL);
 
-      return cb(new Error(`Socket CORS blocked: ${origin}`));
+      return isAllowed
+        ? cb(null, true)
+        : cb(new Error(`Socket CORS blocked: ${origin}`));
     },
     credentials: true,
   },
@@ -76,7 +118,7 @@ const io = new Server(server, {
 app.set("io", io);
 
 // ─────────────────────────────────────────────────────────────
-// Frontend Static Hosting
+// Frontend Static Hosting (only when public/ folder exists)
 // ─────────────────────────────────────────────────────────────
 const publicDir = path.join(__dirname, "../public");
 const hasPublic = fs.existsSync(publicDir);
@@ -86,49 +128,12 @@ if (hasPublic) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Core Middleware
+// Core Middleware (after CORS)
 // ─────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
-
 app.use(cookieParser());
-
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-
-      const allowed =
-        origin.includes("localhost") ||
-        origin.includes("netlify.app") ||
-        origin.includes("onrender.com") ||
-        origin.includes("replit.dev") ||
-        origin.includes("replit.app") ||
-        (ENV.FRONTEND_URL && origin === ENV.FRONTEND_URL);
-
-      if (allowed) {
-        return callback(null, true);
-      }
-
-      console.error("❌ CORS blocked:", origin);
-      return callback(new Error(`CORS blocked: ${origin}`));
-    },
-
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-
-// Explicit preflight handling
-app.options("*splat", cors());
-
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-  })
-);
-
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan("dev"));
 app.use(globalLimiter);
 
@@ -136,7 +141,6 @@ app.use(globalLimiter);
 // API Routes
 // ─────────────────────────────────────────────────────────────
 app.use("/health", healthRouter);
-
 app.use("/api/v1/auth", authRouter);
 app.use("/api/v1/students", studentRouter);
 app.use("/api/v1/leaderboard", leaderboardRouter);
@@ -168,11 +172,7 @@ io.on("connection", (socket) => {
 // 404 + SPA Fallback
 // ─────────────────────────────────────────────────────────────
 app.use((req: Request, res: Response) => {
-  // API → JSON 404
-  if (
-    req.path.startsWith("/api/") ||
-    req.path.startsWith("/health")
-  ) {
+  if (req.path.startsWith("/api/") || req.path.startsWith("/health")) {
     return res.status(404).json({
       success: false,
       data: null,
@@ -180,19 +180,12 @@ app.use((req: Request, res: Response) => {
     });
   }
 
-  // Static asset missing
-  if (
-    req.path.includes(".") &&
-    hasPublic
-  ) {
+  if (req.path.includes(".") && hasPublic) {
     return res.status(404).send("Asset not found");
   }
 
-  // SPA fallback
   if (hasPublic) {
-    return res.sendFile(
-      path.join(publicDir, "index.html")
-    );
+    return res.sendFile(path.join(publicDir, "index.html"));
   }
 
   return res.status(200).json({
@@ -205,25 +198,16 @@ app.use((req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────────────
 // Global Error Handler
 // ─────────────────────────────────────────────────────────────
-app.use(
-  (
-    err: Error,
-    _req: Request,
-    res: Response,
-    _next: NextFunction
-  ) => {
-    console.error("🔥 Unhandled Error:", err);
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("🔥 Unhandled Error:", err);
 
-    res.status(500).json({
-      success: false,
-      data: null,
-      message:
-        ENV.NODE_ENV === "production"
-          ? "Internal server error"
-          : err.message,
-    });
-  }
-);
+  res.status(500).json({
+    success: false,
+    data: null,
+    message:
+      ENV.NODE_ENV === "production" ? "Internal server error" : err.message,
+  });
+});
 
 // ─────────────────────────────────────────────────────────────
 // Boot
@@ -242,12 +226,8 @@ const boot = async () => {
     startSyncCodingJob();
 
     server.listen(ENV.PORT, () => {
-      console.log(
-        `🚀 Server running on port ${ENV.PORT}`
-      );
-      console.log(
-        `🌍 Frontend URL: ${ENV.FRONTEND_URL || "not set"}`
-      );
+      console.log(`🚀 Server running on port ${ENV.PORT}`);
+      console.log(`🌍 Frontend URL: ${ENV.FRONTEND_URL || "not set"}`);
     });
   } catch (err) {
     console.error("❌ Boot failed:", err);
