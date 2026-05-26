@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const leaderboard_controller_1 = require("../controllers/leaderboard.controller");
+const auth_middleware_1 = require("../middleware/auth.middleware");
+const router = (0, express_1.Router)();
+router.use(auth_middleware_1.verifyToken);
+router.get("/global", leaderboard_controller_1.getGlobalLeaderboard);
+router.get("/filter", leaderboard_controller_1.getFilteredLeaderboard);
+router.get("/batch/:batch", leaderboard_controller_1.getBatchLeaderboard);
+router.get("/specialization/:spec", leaderboard_controller_1.getSpecLeaderboard);
+router.get("/my-rank", leaderboard_controller_1.getMyRank);
+exports.default = router;

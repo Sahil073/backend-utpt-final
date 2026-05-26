@@ -1,0 +1,28 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const admin_controller_1 = require("../controllers/admin.controller");
+const auth_middleware_1 = require("../middleware/auth.middleware");
+const validate_middleware_1 = require("../middleware/validate.middleware");
+const admin_validators_1 = require("../validators/admin.validators");
+const upload_middleware_1 = require("../middleware/upload.middleware");
+const router = (0, express_1.Router)();
+router.use(auth_middleware_1.verifyToken);
+router.use((0, auth_middleware_1.requireRole)("admin", "trainer"));
+router.get("/dashboard", admin_controller_1.getDashboard);
+router.get("/students", admin_controller_1.getAllStudents);
+router.get("/students/search", admin_controller_1.searchStudentByEmail);
+router.get("/students/:id/detail", admin_controller_1.getStudentDetail);
+router.get("/poor-performers", admin_controller_1.getPoorPerformers);
+router.get("/top-performers", admin_controller_1.getTopPerformers);
+router.get("/leaderboard", admin_controller_1.getFullLeaderboard);
+router.get("/analytics/activity", admin_controller_1.getActivityAnalytics);
+router.get("/analytics/growth", admin_controller_1.getGrowthAnalytics);
+router.get("/analytics/batch", admin_controller_1.getBatchAnalytics);
+// Admin-only actions
+router.post("/create-trainer", (0, auth_middleware_1.requireRole)("admin"), admin_controller_1.createTrainer);
+router.post("/notify/send", (0, auth_middleware_1.requireRole)("admin"), admin_validators_1.validateSendNotification, validate_middleware_1.validate, admin_controller_1.sendAdminNotification);
+router.post("/import-students", (0, auth_middleware_1.requireRole)("admin"), admin_validators_1.validateImportStudents, validate_middleware_1.validate, admin_controller_1.importStudents);
+router.post("/import-students/file", (0, auth_middleware_1.requireRole)("admin"), upload_middleware_1.uploadStudentFile.single("file"), admin_controller_1.importStudentsFromFile);
+router.put("/students/:id/toggle-active", (0, auth_middleware_1.requireRole)("admin"), admin_controller_1.toggleStudentActive);
+exports.default = router;
