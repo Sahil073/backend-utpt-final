@@ -88,7 +88,7 @@ app.use(cors(corsOptions));
 
 // Handle preflight for ALL routes explicitly
 // "*" not "*splat" — that was the bug
-app.options("*", cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 
 // ─────────────────────────────────────────────────────────────
 // Socket.IO
