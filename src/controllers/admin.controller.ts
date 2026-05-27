@@ -1,21 +1,42 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { supabase } from "../config/db";
-import { redis } from "../config/db";
 import { DailySolveLog } from "../models/DailySolveLog.model";
 import { sendToUser, sendToBatch, sendToAll } from "../services/notification.service";
 import * as XLSX from "xlsx";
 import { parse as csvParse } from "csv-parse/sync";
 
 // ────────────────────────────────────────────────────────────
+// FIELD GLOSSARY (for developers):
+//   top_label  = 1 → student has PORTAL ACCESS (can log in)
+//   top_label  = 0 → analytics-only (tracked, cannot log in)
+//   is_active  = true → account is enabled (not banned/suspended)
+//   is_verified = true → account setup is complete
+//   force_password_change = true → first-login flag; student must change password
+//
+// Import flow:
+//   top_label=1 → creates portal account, sets hashed password, is_active=true
+//   top_label=0 → stores student data only, NO login possible
+//
+// "Disable" button → toggles is_active (bans/unbans a portal student)
+// ────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────
 // GET /admin/dashboard
 // ────────────────────────────────────────────────────────────
 export const getDashboard = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { count: totalStudents } = await supabase
+    const { count: totalPortal } = await supabase
       .from("users")
       .select("*", { count: "exact", head: true })
-      .eq("role", "student");
+      .eq("role", "student")
+      .eq("top_label", 1);
+
+    const { count: totalAnalytics } = await supabase
+      .from("users")
+      .select("*", { count: "exact", head: true })
+      .eq("role", "student")
+      .eq("top_label", 0);
 
     const { data: scoreData } = await supabase
       .from("scores")
@@ -52,21 +73,15 @@ export const getDashboard = async (req: Request, res: Response): Promise<void> =
       topScorer = { ...topScorerData, name: topUser?.name, username: topUser?.username };
     }
 
-    // Count top_label students (tracked but no portal)
-    const { count: analyticsOnly } = await supabase
-      .from("users")
-      .select("*", { count: "exact", head: true })
-      .eq("role", "student")
-      .eq("top_label", 0);
-
     res.status(200).json({
       success: true,
       data: {
-        total_students: totalStudents,
+        total_students: (totalPortal ?? 0) + (totalAnalytics ?? 0),
+        portal_students: totalPortal ?? 0,
+        analytics_only: totalAnalytics ?? 0,
         active_today: activeToday,
         avg_score: avgScore,
         top_scorer: topScorer,
-        analytics_only: analyticsOnly ?? 0,
       },
       message: "Dashboard stats fetched",
     });
@@ -120,6 +135,9 @@ export const getAllStudents = async (req: Request, res: Response): Promise<void>
     const enriched = (students || []).map((s) => ({
       ...s,
       total_score: scoresMap[s.id] ?? 0,
+      // Human-readable flags for frontend
+      has_portal_access: s.top_label === 1,
+      account_status: s.is_active ? "active" : "disabled",
     }));
 
     res.status(200).json({
@@ -171,7 +189,8 @@ export const getStudentDetail = async (req: Request, res: Response): Promise<voi
       data: {
         profile: {
           ...profile,
-          github_username: profile.github_username,
+          has_portal_access: profile.top_label === 1,
+          account_status: profile.is_active ? "active" : "disabled",
         },
         stats: {
           academics: {
@@ -188,6 +207,7 @@ export const getStudentDetail = async (req: Request, res: Response): Promise<voi
           },
           github: {
             total_commits: github?.total_commits ?? 0,
+            code_commits: github?.code_commits ?? 0,
             public_repos: github?.repos_contributed ?? 0,
           },
           score: {
@@ -210,6 +230,7 @@ export const getStudentDetail = async (req: Request, res: Response): Promise<voi
 
 // ────────────────────────────────────────────────────────────
 // GET /admin/poor-performers
+// Students with portal access (top_label=1) who haven't solved in 7 days
 // ────────────────────────────────────────────────────────────
 export const getPoorPerformers = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -222,7 +243,7 @@ export const getPoorPerformers = async (req: Request, res: Response): Promise<vo
       .select("id, name, username, email, college_id, batch, specialization, avatar_url")
       .eq("role", "student")
       .eq("is_active", true)
-      .eq("top_label", 1);
+      .eq("top_label", 1); // Only portal students
 
     if (!students || students.length === 0) {
       res.status(200).json({ success: true, data: [], message: "No students found" });
@@ -374,36 +395,7 @@ export const sendAdminNotification = async (req: Request, res: Response): Promis
 };
 
 // ────────────────────────────────────────────────────────────
-// POST /admin/import-students  (JSON body)
-// New fields: tenth_percentage, twelfth_percentage, cpi, gender, top_label, father_number
-// top_label=1 → create portal account (father_number as initial password)
-// top_label=0 → store only (no login access)
-// ────────────────────────────────────────────────────────────
-export const importStudents = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const students: StudentRow[] = req.body.students;
-
-    if (!Array.isArray(students) || students.length === 0) {
-      res.status(400).json({ success: false, data: null, message: "students array is required" });
-      return;
-    }
-
-    const result = await processStudentImport(students);
-
-    res.status(200).json({
-      success: true,
-      data: result,
-      message: `${result.total} students processed (${result.portal_accounts} portal accounts created)`,
-    });
-  } catch (err) {
-    console.error("importStudents error:", err);
-    res.status(500).json({ success: false, data: null, message: "Internal server error" });
-  }
-};
-
-// ────────────────────────────────────────────────────────────
-// POST /admin/import-students/file
-// Multipart CSV/Excel upload
+// Student row type for import
 // ────────────────────────────────────────────────────────────
 type StudentRow = {
   name: string;
@@ -419,112 +411,193 @@ type StudentRow = {
   twelfth_percentage?: number;
   cpi?: number;
   gender?: string;
-  top_label?: number;
+  top_label: number; // 1 = portal access, 0 = analytics only
   father_number?: string;
 };
 
-function normalizeRow(raw: Record<string, string>): StudentRow {
+// ────────────────────────────────────────────────────────────
+// Flexible column name normalizer for CSV/Excel rows
+// Handles variations like "College ID", "college_id", "EnrollmentNo", etc.
+// ────────────────────────────────────────────────────────────
+function normalizeRow(raw: Record<string, any>): StudentRow {
   const get = (...keys: string[]): string => {
     for (const k of keys) {
+      const normalizedKey = k.toLowerCase().replace(/[\s_\-]/g, "");
       const found = Object.keys(raw).find(
-        (rk) => rk.trim().toLowerCase().replace(/[\s_\-]/g, "") === k.toLowerCase().replace(/[\s_\-]/g, "")
+        (rk) => rk.trim().toLowerCase().replace(/[\s_\-]/g, "") === normalizedKey
       );
-      if (found && raw[found]?.trim()) return raw[found].trim();
+      if (found && String(raw[found] ?? "").trim())
+        return String(raw[found]).trim();
     }
     return "";
   };
 
-  const topLabelRaw = get("toplabel", "top_label", "label", "portal");
-  const topLabel = topLabelRaw === "1" || topLabelRaw.toLowerCase() === "yes" ? 1 : 0;
+  // top_label: 1 = portal access, 0 = analytics only
+  // Accept: "1", "yes", "true", "portal" → 1; anything else → 0
+  const topLabelRaw = get("toplabel", "top_label", "label", "portal", "portalaccess", "hasportal");
+  const topLabel =
+    topLabelRaw === "1" ||
+    topLabelRaw.toLowerCase() === "yes" ||
+    topLabelRaw.toLowerCase() === "true" ||
+    topLabelRaw.toLowerCase() === "portal"
+      ? 1
+      : 0;
 
-  const tenthRaw = get("tenth", "tenth_percentage", "10th", "10thpercent", "tenthpercent");
-  const twelfthRaw = get("twelfth", "twelfth_percentage", "12th", "12thpercent", "twelfthpercent");
-  const cpiRaw = get("cpi", "cgpa", "gpa");
+  const tenthRaw = get("tenth", "tenth_percentage", "10th", "10thpercent", "tenthpercent", "10thpercentage");
+  const twelfthRaw = get("twelfth", "twelfth_percentage", "12th", "12thpercent", "twelfthpercent", "12thpercentage");
+  const cpiRaw = get("cpi", "cgpa", "gpa", "sgpa");
 
   return {
-    name:                get("name", "fullname", "studentname"),
-    college_id:          get("collegeid", "college_id", "enrollment", "enrollmentno", "id"),
-    email:               get("email", "emailid", "collegemail"),
-    batch:               get("batch", "year", "batchyear"),
-    specialization:      get("specialization", "spec", "branch", "department") || undefined,
-    roll_number:         get("rollnumber", "roll_number", "rollno", "roll") || undefined,
-    leetcode_username:   get("leetcodeusername", "leetcode_username", "leetcode", "lc") || undefined,
-    github_username:     get("githubusername", "github_username", "github", "gh") || undefined,
-    codeforces_username: get("codeforcesusername", "codeforces_username", "codeforces", "cf", "cfhandle") || undefined,
-    tenth_percentage:    tenthRaw ? parseFloat(tenthRaw) : undefined,
-    twelfth_percentage:  twelfthRaw ? parseFloat(twelfthRaw) : undefined,
-    cpi:                 cpiRaw ? parseFloat(cpiRaw) : undefined,
-    gender:              get("gender", "sex") || undefined,
-    top_label:           topLabel,
-    father_number:       get("fathernumber", "father_number", "fathermobile", "fatherphone", "fathercontact") || undefined,
+    name: get("name", "fullname", "studentname", "student_name"),
+    college_id: get("collegeid", "college_id", "enrollment", "enrollmentno", "enrollmentnumber", "id", "studentid"),
+    email: get("email", "emailid", "collegemail", "email_id", "college_email"),
+    batch: get("batch", "year", "batchyear", "batch_year"),
+    specialization: get("specialization", "spec", "branch", "department", "dept") || undefined,
+    roll_number: get("rollnumber", "roll_number", "rollno", "roll", "roll_no") || undefined,
+    leetcode_username: get("leetcodeusername", "leetcode_username", "leetcode", "lc", "lc_username") || undefined,
+    github_username: get("githubusername", "github_username", "github", "gh", "gh_username") || undefined,
+    codeforces_username: get("codeforcesusername", "codeforces_username", "codeforces", "cf", "cfhandle", "cf_handle") || undefined,
+    tenth_percentage: tenthRaw ? parseFloat(tenthRaw) : undefined,
+    twelfth_percentage: twelfthRaw ? parseFloat(twelfthRaw) : undefined,
+    cpi: cpiRaw ? parseFloat(cpiRaw) : undefined,
+    gender: get("gender", "sex") || undefined,
+    top_label: topLabel,
+    father_number: get("fathernumber", "father_number", "fathermobile", "fatherphone", "fathercontact", "father_contact") || undefined,
   };
 }
 
-// Auto-generate initial password for portal students
-// Priority: father_number → roll_number@name(first4) → college_id@utpt
+// ────────────────────────────────────────────────────────────
+// Generate initial password for portal students
+// Priority: father_number → roll_number@name(4) → college_id@utpt
+// ────────────────────────────────────────────────────────────
 function generateInitialPassword(s: StudentRow): string {
-  if (s.father_number) return s.father_number;
+  if (s.father_number && s.father_number.length >= 6) return s.father_number;
   if (s.roll_number && s.name) {
     return `${s.roll_number}@${s.name.substring(0, 4).toLowerCase()}`;
   }
-  if (s.roll_number) return s.roll_number;
+  if (s.roll_number) return `${s.roll_number}@utpt`;
   return `${s.college_id}@utpt`;
 }
 
-// Core import logic — shared by JSON and file endpoints
+// ────────────────────────────────────────────────────────────
+// Core import logic — used by both JSON and file endpoints
+// Returns summary stats and list of errors
+// ────────────────────────────────────────────────────────────
 async function processStudentImport(students: StudentRow[]) {
   let portalCount = 0;
   let analyticsCount = 0;
+  const errors: string[] = [];
+  const skipped: string[] = [];
 
   for (const s of students) {
-    const isPortal = (s.top_label ?? 0) === 1;
+    try {
+      const isPortal = s.top_label === 1;
 
-    let passwordHash: string | null = null;
-    if (isPortal) {
-      const rawPassword = generateInitialPassword(s);
-      passwordHash = await bcrypt.hash(rawPassword, 12);
+      const record: Record<string, any> = {
+        name: s.name,
+        college_id: s.college_id,
+        email: s.email,
+        batch: s.batch,
+        specialization: s.specialization || null,
+        roll_number: s.roll_number || null,
+        leetcode_username: s.leetcode_username || null,
+        github_username: s.github_username || null,
+        codeforces_username: s.codeforces_username || null,
+        tenth_percentage: s.tenth_percentage ?? null,
+        twelfth_percentage: s.twelfth_percentage ?? null,
+        cpi: s.cpi ?? null,
+        gender: s.gender || null,
+        top_label: s.top_label,
+        role: "student",
+        // Portal students: active & verified; analytics-only: inactive, not verified
+        is_active: isPortal,
+        is_verified: isPortal,
+        force_password_change: isPortal,
+      };
+
+      if (isPortal) {
+        const rawPassword = generateInitialPassword(s);
+        record.password_hash = await bcrypt.hash(rawPassword, 12);
+      }
+
+      const { error: upsertError } = await supabase
+        .from("users")
+        .upsert(record, { onConflict: "college_id", ignoreDuplicates: false });
+
+      if (upsertError) {
+        errors.push(`${s.college_id}: ${upsertError.message}`);
+        continue;
+      }
+
+      // Initialize score row for portal students so they appear on leaderboard
+      if (isPortal) {
+        const { data: newUser } = await supabase
+          .from("users")
+          .select("id")
+          .eq("college_id", s.college_id)
+          .single();
+
+        if (newUser?.id) {
+          // Upsert score row with zeros so they appear on leaderboard immediately
+          await supabase.from("scores").upsert(
+            {
+              user_id: newUser.id,
+              academics_score: 0,
+              coding_score: 0,
+              dev_score: 0,
+              total_score: 0,
+              last_computed: new Date().toISOString(),
+            },
+            { onConflict: "user_id", ignoreDuplicates: false }
+          );
+        }
+
+        portalCount++;
+      } else {
+        analyticsCount++;
+      }
+    } catch (err: any) {
+      errors.push(`${s.college_id || "unknown"}: ${err.message}`);
     }
-
-    const record: Record<string, any> = {
-      name:                s.name,
-      college_id:          s.college_id,
-      email:               s.email,
-      batch:               s.batch,
-      specialization:      s.specialization      || null,
-      roll_number:         s.roll_number         || null,
-      leetcode_username:   s.leetcode_username   || null,
-      github_username:     s.github_username     || null,
-      codeforces_username: s.codeforces_username || null,
-      tenth_percentage:    s.tenth_percentage    ?? null,
-      twelfth_percentage:  s.twelfth_percentage  ?? null,
-      cpi:                 s.cpi                 ?? null,
-      gender:              s.gender              || null,
-      top_label:           s.top_label           ?? 0,
-      role:                "student",
-      is_active:           isPortal,
-      is_verified:         isPortal,
-      force_password_change: isPortal ? true : false,
-    };
-
-    if (isPortal && passwordHash) {
-      record.password_hash = passwordHash;
-    }
-
-    await supabase
-      .from("users")
-      .upsert(record, { onConflict: "college_id", ignoreDuplicates: false });
-
-    if (isPortal) portalCount++;
-    else analyticsCount++;
   }
 
   return {
     total: students.length,
     portal_accounts: portalCount,
     analytics_only: analyticsCount,
+    failed: errors.length,
+    errors: errors.slice(0, 20), // cap at 20 for response size
   };
 }
 
+// ────────────────────────────────────────────────────────────
+// POST /admin/import-students  (JSON body)
+// ────────────────────────────────────────────────────────────
+export const importStudents = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const students: StudentRow[] = req.body.students;
+
+    if (!Array.isArray(students) || students.length === 0) {
+      res.status(400).json({ success: false, data: null, message: "students array is required" });
+      return;
+    }
+
+    const result = await processStudentImport(students);
+
+    res.status(200).json({
+      success: true,
+      data: result,
+      message: `${result.total} students processed — ${result.portal_accounts} portal accounts created, ${result.analytics_only} analytics-only, ${result.failed} failed`,
+    });
+  } catch (err) {
+    console.error("importStudents error:", err);
+    res.status(500).json({ success: false, data: null, message: "Internal server error" });
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// POST /admin/import-students/file  (CSV / Excel upload)
+// ────────────────────────────────────────────────────────────
 export const importStudentsFromFile = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.file) {
@@ -533,15 +606,15 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
     }
 
     const ext = req.file.originalname.split(".").pop()?.toLowerCase();
-    let rows: Record<string, string>[] = [];
+    let rows: Record<string, any>[] = [];
 
     if (ext === "csv") {
       const text = req.file.buffer.toString("utf-8");
-      rows = csvParse(text, { columns: true, skip_empty_lines: true, trim: true }) as Record<string, string>[];
+      rows = csvParse(text, { columns: true, skip_empty_lines: true, trim: true }) as Record<string, any>[];
     } else if (ext === "xlsx" || ext === "xls") {
       const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      rows = XLSX.utils.sheet_to_json<Record<string, string>>(sheet, { defval: "" });
+      rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, { defval: "" });
     } else {
       res.status(400).json({ success: false, data: null, message: "Unsupported file format. Use CSV or Excel (.xlsx/.xls)." });
       return;
@@ -554,19 +627,21 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
 
     const students: StudentRow[] = rows.map(normalizeRow);
 
-    const errors: string[] = [];
+    // Validate required fields
+    const validationErrors: string[] = [];
     students.forEach((s, i) => {
-      if (!s.name)       errors.push(`Row ${i + 2}: missing name`);
-      if (!s.college_id) errors.push(`Row ${i + 2}: missing college_id / enrollment`);
-      if (!s.email)      errors.push(`Row ${i + 2}: missing email`);
-      if (!s.batch)      errors.push(`Row ${i + 2}: missing batch`);
+      const rowNum = i + 2; // +2 because row 1 is header
+      if (!s.name)       validationErrors.push(`Row ${rowNum}: missing name`);
+      if (!s.college_id) validationErrors.push(`Row ${rowNum}: missing college_id / enrollment`);
+      if (!s.email)      validationErrors.push(`Row ${rowNum}: missing email`);
+      if (!s.batch)      validationErrors.push(`Row ${rowNum}: missing batch`);
     });
 
-    if (errors.length > 0) {
+    if (validationErrors.length > 0) {
       res.status(400).json({
         success: false,
-        data: { errors },
-        message: `Validation failed for ${errors.length} row(s). Fix and re-upload.`,
+        data: { errors: validationErrors.slice(0, 20) },
+        message: `Validation failed for ${validationErrors.length} row(s). Fix and re-upload.`,
       });
       return;
     }
@@ -576,7 +651,7 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
     res.status(200).json({
       success: true,
       data: { ...result, file: req.file.originalname },
-      message: `${result.total} students imported from ${req.file.originalname} (${result.portal_accounts} portal accounts)`,
+      message: `${result.total} students imported from ${req.file.originalname} — ${result.portal_accounts} portal accounts, ${result.analytics_only} analytics-only, ${result.failed} failed`,
     });
   } catch (err) {
     console.error("importStudentsFromFile error:", err);
@@ -586,6 +661,9 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
 
 // ────────────────────────────────────────────────────────────
 // PUT /admin/students/:id/toggle-active
+// Enables or disables a portal student's account.
+// This does NOT affect top_label — the student still has portal access,
+// they just can't log in while is_active=false (suspended/banned).
 // ────────────────────────────────────────────────────────────
 export const toggleStudentActive = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -593,7 +671,7 @@ export const toggleStudentActive = async (req: Request, res: Response): Promise<
 
     const { data: user } = await supabase
       .from("users")
-      .select("is_active")
+      .select("is_active, top_label, name")
       .eq("id", id)
       .single();
 
@@ -602,9 +680,21 @@ export const toggleStudentActive = async (req: Request, res: Response): Promise<
       return;
     }
 
+    // Only portal students can be toggled (analytics-only have no login anyway)
+    if (user.top_label !== 1) {
+      res.status(400).json({
+        success: false,
+        data: null,
+        message: "This student has no portal access. Only portal students (top_label=1) can be enabled/disabled.",
+      });
+      return;
+    }
+
+    const newActiveState = !user.is_active;
+
     const { data: updated } = await supabase
       .from("users")
-      .update({ is_active: !user.is_active })
+      .update({ is_active: newActiveState })
       .eq("id", id)
       .select("id, name, is_active")
       .single();
@@ -612,7 +702,7 @@ export const toggleStudentActive = async (req: Request, res: Response): Promise<
     res.status(200).json({
       success: true,
       data: updated,
-      message: `Student ${updated?.is_active ? "activated" : "deactivated"}`,
+      message: `Student "${user.name}" ${newActiveState ? "enabled (can now log in)" : "disabled (login blocked)"}`,
     });
   } catch (err) {
     console.error("toggleStudentActive error:", err);
@@ -689,6 +779,7 @@ export const createTrainer = async (req: Request, res: Response): Promise<void> 
         is_active: true,
         is_verified: true,
         force_password_change: false,
+        top_label: 1, // Trainers always have portal access
       })
       .select("id, name, email, college_id, role")
       .single();
@@ -737,11 +828,7 @@ export const searchStudentByEmail = async (req: Request, res: Response): Promise
       if (name)       orParts.push(`name.ilike.%${name.trim()}%`);
       if (email)      orParts.push(`email.ilike.%${email.trim()}%`);
       if (college_id) orParts.push(`college_id.ilike.%${college_id.trim()}%`);
-
-      if (orParts.length > 0) {
-        query = query.or(orParts.join(","));
-      }
-
+      if (orParts.length > 0) query = query.or(orParts.join(","));
       if (batch) query = query.eq("batch", batch.trim());
     }
 
@@ -756,7 +843,11 @@ export const searchStudentByEmail = async (req: Request, res: Response): Promise
 
     res.status(200).json({
       success: true,
-      data: students || [],
+      data: (students || []).map(s => ({
+        ...s,
+        has_portal_access: s.top_label === 1,
+        account_status: s.is_active ? "active" : "disabled",
+      })),
       message: `${(students || []).length} result(s) found`,
     });
   } catch (err) {
