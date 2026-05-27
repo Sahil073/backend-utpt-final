@@ -520,19 +520,24 @@ async function triggerAutoSync(
       supabase.from("users").select("tenth_percentage, twelfth_percentage, cpi").eq("id", userId).single(),
     ]);
 
-    const coding = codingRes.data  || {};
-    const github = githubRes.data  || {};
-    const user   = userRes.data    || {};
+const coding = codingRes.data || {};
+const github = githubRes.data || {};
 
-    const { academicsScore, codingScore, devScore, totalScore } = computeScore(
-      {
-        tenth_percentage:   user.tenth_percentage   ?? null,
-        twelfth_percentage: user.twelfth_percentage ?? null,
-        cpi:                user.cpi                ?? null,
-      },
-      coding,
-      github
-    );
+const user = userRes.data as {
+  tenth_percentage?: number | null;
+  twelfth_percentage?: number | null;
+  cpi?: number | null;
+} | null;
+
+const { academicsScore, codingScore, devScore, totalScore } = computeScore(
+  {
+    tenth_percentage: user?.tenth_percentage ?? null,
+    twelfth_percentage: user?.twelfth_percentage ?? null,
+    cpi: user?.cpi ?? null,
+  },
+  coding,
+  github
+);
 
     await supabase.from("scores").upsert(
       {
