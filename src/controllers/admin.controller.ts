@@ -5,20 +5,37 @@ import { DailySolveLog } from "../models/DailySolveLog.model";
 import { sendToUser, sendToBatch, sendToAll } from "../services/notification.service";
 import * as XLSX from "xlsx";
 import { parse as csvParse } from "csv-parse/sync";
+import { syncUserCoding } from "../services/coding.service";
+import { syncUserGitHub } from "../services/github.service";
+import { computeScore } from "../services/scoring.service";
 
 // ────────────────────────────────────────────────────────────
 // FIELD GLOSSARY (for developers):
+//
 //   top_label  = 1 → student has PORTAL ACCESS (can log in)
 //   top_label  = 0 → analytics-only (tracked, cannot log in)
-//   is_active  = true → account is enabled (not banned/suspended)
-//   is_verified = true → account setup is complete
-//   force_password_change = true → first-login flag; student must change password
+//
+//   is_active  = true  → account is ENABLED  (can log in)
+//   is_active  = false → account is DISABLED  (login blocked / suspended)
+//
+//   is_verified = true → account setup complete (password changed at least once)
+//
+//   force_password_change = true → first-login flag; student must set a new
+//                                  password before using the platform
 //
 // Import flow:
-//   top_label=1 → creates portal account, sets hashed password, is_active=true
-//   top_label=0 → stores student data only, NO login possible
+//   top_label=1 → creates a real portal account with a hashed initial
+//                 password, is_active=true, force_password_change=true
+//   top_label=0 → stores student data for analytics only; NO login possible
 //
-// "Disable" button → toggles is_active (bans/unbans a portal student)
+// "Disable" button → toggles is_active on a portal student (top_label=1).
+//   Disabled students cannot log in but their data is retained.
+//   This does NOT remove portal access (top_label stays 1).
+//
+// Auto-sync on import:
+//   After a portal student is inserted/updated the system immediately
+//   fires a background sync for LeetCode, Codeforces, and GitHub so
+//   the student appears on the leaderboard with real data right away.
 // ────────────────────────────────────────────────────────────
 
 // ────────────────────────────────────────────────────────────
@@ -76,12 +93,12 @@ export const getDashboard = async (req: Request, res: Response): Promise<void> =
     res.status(200).json({
       success: true,
       data: {
-        total_students: (totalPortal ?? 0) + (totalAnalytics ?? 0),
-        portal_students: totalPortal ?? 0,
-        analytics_only: totalAnalytics ?? 0,
-        active_today: activeToday,
-        avg_score: avgScore,
-        top_scorer: topScorer,
+        total_students:  (totalPortal ?? 0) + (totalAnalytics ?? 0),
+        portal_students: totalPortal    ?? 0,
+        analytics_only:  totalAnalytics ?? 0,
+        active_today:    activeToday,
+        avg_score:       avgScore,
+        top_scorer:      topScorer,
       },
       message: "Dashboard stats fetched",
     });
@@ -97,7 +114,7 @@ export const getDashboard = async (req: Request, res: Response): Promise<void> =
 export const getAllStudents = async (req: Request, res: Response): Promise<void> => {
   try {
     const { batch, specialization, name, page = "1", top_label } = req.query;
-    const limit = 20;
+    const limit  = 20;
     const offset = (parseInt(page as string) - 1) * limit;
 
     let query = supabase
@@ -110,10 +127,11 @@ export const getAllStudents = async (req: Request, res: Response): Promise<void>
       .range(offset, offset + limit - 1)
       .order("created_at", { ascending: false });
 
-    if (batch) query = query.eq("batch", batch);
+    if (batch)        query = query.eq("batch", batch);
     if (specialization) query = query.eq("specialization", specialization);
-    if (name) query = query.ilike("name", `%${name}%`);
-    if (top_label !== undefined) query = query.eq("top_label", parseInt(top_label as string));
+    if (name)         query = query.ilike("name", `%${name}%`);
+    if (top_label !== undefined)
+      query = query.eq("top_label", parseInt(top_label as string));
 
     const { data: students, error, count } = await query;
 
@@ -134,10 +152,9 @@ export const getAllStudents = async (req: Request, res: Response): Promise<void>
 
     const enriched = (students || []).map((s) => ({
       ...s,
-      total_score: scoresMap[s.id] ?? 0,
-      // Human-readable flags for frontend
+      total_score:       scoresMap[s.id] ?? 0,
       has_portal_access: s.top_label === 1,
-      account_status: s.is_active ? "active" : "disabled",
+      account_status:    s.is_active ? "active" : "disabled",
     }));
 
     res.status(200).json({
@@ -180,9 +197,9 @@ export const getStudentDetail = async (req: Request, res: Response): Promise<voi
       .lean();
 
     const profile = userRes.data;
-    const coding = codingRes.data;
-    const github = githubRes.data;
-    const score = scoreRes.data;
+    const coding  = codingRes.data;
+    const github  = githubRes.data;
+    const score   = scoreRes.data;
 
     res.status(200).json({
       success: true,
@@ -190,32 +207,32 @@ export const getStudentDetail = async (req: Request, res: Response): Promise<voi
         profile: {
           ...profile,
           has_portal_access: profile.top_label === 1,
-          account_status: profile.is_active ? "active" : "disabled",
+          account_status:    profile.is_active ? "active" : "disabled",
         },
         stats: {
           academics: {
-            tenth_percentage: profile.tenth_percentage ?? null,
+            tenth_percentage:   profile.tenth_percentage   ?? null,
             twelfth_percentage: profile.twelfth_percentage ?? null,
-            cpi: profile.cpi ?? null,
+            cpi:                profile.cpi                ?? null,
           },
           coding: {
-            leetcode_solved: coding?.lc_total_solved ?? 0,
-            codeforces_rating: coding?.cf_rating ?? 0,
-            codeforces_solved: coding?.cf_solved ?? 0,
-            leetcode_username: profile.leetcode_username,
+            leetcode_solved:     coding?.lc_total_solved  ?? 0,
+            codeforces_rating:   coding?.cf_rating        ?? 0,
+            codeforces_solved:   coding?.cf_solved        ?? 0,
+            leetcode_username:   profile.leetcode_username,
             codeforces_username: profile.codeforces_username,
           },
           github: {
-            total_commits: github?.total_commits ?? 0,
-            code_commits: github?.code_commits ?? 0,
-            public_repos: github?.repos_contributed ?? 0,
+            total_commits: github?.total_commits     ?? 0,
+            code_commits:  github?.code_commits      ?? 0,
+            public_repos:  github?.repos_contributed ?? 0,
           },
           score: {
-            total_score: score?.total_score ?? 0,
+            total_score:     score?.total_score     ?? 0,
             academics_score: score?.academics_score ?? 0,
-            coding_score: score?.coding_score ?? 0,
-            dev_score: score?.dev_score ?? 0,
-            rank: score?.rank ?? null,
+            coding_score:    score?.coding_score    ?? 0,
+            dev_score:       score?.dev_score       ?? 0,
+            rank:            score?.rank            ?? null,
           },
         },
         history,
@@ -230,7 +247,6 @@ export const getStudentDetail = async (req: Request, res: Response): Promise<voi
 
 // ────────────────────────────────────────────────────────────
 // GET /admin/poor-performers
-// Students with portal access (top_label=1) who haven't solved in 7 days
 // ────────────────────────────────────────────────────────────
 export const getPoorPerformers = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -243,7 +259,7 @@ export const getPoorPerformers = async (req: Request, res: Response): Promise<vo
       .select("id, name, username, email, college_id, batch, specialization, avatar_url")
       .eq("role", "student")
       .eq("is_active", true)
-      .eq("top_label", 1); // Only portal students
+      .eq("top_label", 1);
 
     if (!students || students.length === 0) {
       res.status(200).json({ success: true, data: [], message: "No students found" });
@@ -251,11 +267,11 @@ export const getPoorPerformers = async (req: Request, res: Response): Promise<vo
     }
 
     const activeLogs = await DailySolveLog.distinct("user_id", {
-      date: { $gte: sinceStr },
+      date:         { $gte: sinceStr },
       total_solved: { $gt: 0 },
     });
 
-    const activeSet = new Set(activeLogs);
+    const activeSet     = new Set(activeLogs);
     const poorPerformers = students.filter((s) => !activeSet.has(s.id));
 
     const enriched = await Promise.all(
@@ -267,11 +283,7 @@ export const getPoorPerformers = async (req: Request, res: Response): Promise<vo
       })
     );
 
-    res.status(200).json({
-      success: true,
-      data: enriched,
-      message: "Poor performers fetched",
-    });
+    res.status(200).json({ success: true, data: enriched, message: "Poor performers fetched" });
   } catch (err) {
     console.error("getPoorPerformers error:", err);
     res.status(500).json({ success: false, data: null, message: "Internal server error" });
@@ -289,7 +301,7 @@ export const getTopPerformers = async (req: Request, res: Response): Promise<voi
       .order("total_score", { ascending: false })
       .limit(10);
 
-    const topIds = (topScores || []).map((s) => s.user_id);
+    const topIds     = (topScores || []).map((s) => s.user_id);
     let topUsers: Record<string, any> = {};
 
     if (topIds.length > 0) {
@@ -302,11 +314,11 @@ export const getTopPerformers = async (req: Request, res: Response): Promise<voi
 
     const globalTop = (topScores || []).map((s) => ({
       ...topUsers[s.user_id],
-      total_score: s.total_score,
+      total_score:     s.total_score,
       academics_score: s.academics_score,
-      coding_score: s.coding_score,
-      dev_score: s.dev_score,
-      rank: s.rank,
+      coding_score:    s.coding_score,
+      dev_score:       s.dev_score,
+      rank:            s.rank,
     }));
 
     res.status(200).json({
@@ -346,7 +358,6 @@ export const getFullLeaderboard = async (req: Request, res: Response): Promise<v
     }
 
     const data = (scores || []).map((s) => ({ ...usersMap[s.user_id], ...s }));
-
     res.status(200).json({ success: true, data, message: "Full leaderboard fetched" });
   } catch (err) {
     console.error("getFullLeaderboard error:", err);
@@ -370,19 +381,16 @@ export const sendAdminNotification = async (req: Request, res: Response): Promis
     const opts = {
       title,
       body,
-      notifType: type || "announcement",
-      sendEmail: true,
-      sendPush: true,
+      notifType:  type || "announcement",
+      sendEmail:  true,
+      sendPush:   true,
       io,
     };
 
-    if (target === "all") {
-      sendToAll(opts).catch(console.error);
-    } else if (target === "batch" && batch) {
-      sendToBatch(batch, opts).catch(console.error);
-    } else if (target === "user" && userId) {
-      sendToUser(userId, opts).catch(console.error);
-    } else {
+    if      (target === "all")               sendToAll(opts).catch(console.error);
+    else if (target === "batch"  && batch)   sendToBatch(batch, opts).catch(console.error);
+    else if (target === "user"   && userId)  sendToUser(userId, opts).catch(console.error);
+    else {
       res.status(400).json({ success: false, data: null, message: "Invalid target. Use all | batch (with batch) | user (with userId)" });
       return;
     }
@@ -398,26 +406,25 @@ export const sendAdminNotification = async (req: Request, res: Response): Promis
 // Student row type for import
 // ────────────────────────────────────────────────────────────
 type StudentRow = {
-  name: string;
-  college_id: string;
-  email: string;
-  batch: string;
-  specialization?: string;
-  roll_number?: string;
-  leetcode_username?: string;
-  github_username?: string;
+  name:                string;
+  college_id:          string;
+  email:               string;
+  batch:               string;
+  specialization?:     string;
+  roll_number?:        string;
+  leetcode_username?:  string;
+  github_username?:    string;
   codeforces_username?: string;
-  tenth_percentage?: number;
+  tenth_percentage?:   number;
   twelfth_percentage?: number;
-  cpi?: number;
-  gender?: string;
-  top_label: number; // 1 = portal access, 0 = analytics only
-  father_number?: string;
+  cpi?:                number;
+  gender?:             string;
+  top_label:           number; // 1 = portal access, 0 = analytics only
+  father_number?:      string;
 };
 
 // ────────────────────────────────────────────────────────────
-// Flexible column name normalizer for CSV/Excel rows
-// Handles variations like "College ID", "college_id", "EnrollmentNo", etc.
+// Flexible column-name normaliser for CSV / Excel rows
 // ────────────────────────────────────────────────────────────
 function normalizeRow(raw: Record<string, any>): StudentRow {
   const get = (...keys: string[]): string => {
@@ -432,37 +439,34 @@ function normalizeRow(raw: Record<string, any>): StudentRow {
     return "";
   };
 
-  // top_label: 1 = portal access, 0 = analytics only
-  // Accept: "1", "yes", "true", "portal" → 1; anything else → 0
   const topLabelRaw = get("toplabel", "top_label", "label", "portal", "portalaccess", "hasportal");
   const topLabel =
     topLabelRaw === "1" ||
-    topLabelRaw.toLowerCase() === "yes" ||
-    topLabelRaw.toLowerCase() === "true" ||
+    topLabelRaw.toLowerCase() === "yes"    ||
+    topLabelRaw.toLowerCase() === "true"   ||
     topLabelRaw.toLowerCase() === "portal"
-      ? 1
-      : 0;
+      ? 1 : 0;
 
-  const tenthRaw = get("tenth", "tenth_percentage", "10th", "10thpercent", "tenthpercent", "10thpercentage");
+  const tenthRaw   = get("tenth", "tenth_percentage", "10th", "10thpercent", "tenthpercent", "10thpercentage");
   const twelfthRaw = get("twelfth", "twelfth_percentage", "12th", "12thpercent", "twelfthpercent", "12thpercentage");
-  const cpiRaw = get("cpi", "cgpa", "gpa", "sgpa");
+  const cpiRaw     = get("cpi", "cgpa", "gpa", "sgpa");
 
   return {
-    name: get("name", "fullname", "studentname", "student_name"),
-    college_id: get("collegeid", "college_id", "enrollment", "enrollmentno", "enrollmentnumber", "id", "studentid"),
-    email: get("email", "emailid", "collegemail", "email_id", "college_email"),
-    batch: get("batch", "year", "batchyear", "batch_year"),
-    specialization: get("specialization", "spec", "branch", "department", "dept") || undefined,
-    roll_number: get("rollnumber", "roll_number", "rollno", "roll", "roll_no") || undefined,
-    leetcode_username: get("leetcodeusername", "leetcode_username", "leetcode", "lc", "lc_username") || undefined,
-    github_username: get("githubusername", "github_username", "github", "gh", "gh_username") || undefined,
+    name:                get("name", "fullname", "studentname", "student_name"),
+    college_id:          get("collegeid", "college_id", "enrollment", "enrollmentno", "enrollmentnumber", "id", "studentid"),
+    email:               get("email", "emailid", "collegemail", "email_id", "college_email"),
+    batch:               get("batch", "year", "batchyear", "batch_year"),
+    specialization:      get("specialization", "spec", "branch", "department", "dept") || undefined,
+    roll_number:         get("rollnumber", "roll_number", "rollno", "roll", "roll_no") || undefined,
+    leetcode_username:   get("leetcodeusername", "leetcode_username", "leetcode", "lc", "lc_username") || undefined,
+    github_username:     get("githubusername", "github_username", "github", "gh", "gh_username") || undefined,
     codeforces_username: get("codeforcesusername", "codeforces_username", "codeforces", "cf", "cfhandle", "cf_handle") || undefined,
-    tenth_percentage: tenthRaw ? parseFloat(tenthRaw) : undefined,
-    twelfth_percentage: twelfthRaw ? parseFloat(twelfthRaw) : undefined,
-    cpi: cpiRaw ? parseFloat(cpiRaw) : undefined,
-    gender: get("gender", "sex") || undefined,
-    top_label: topLabel,
-    father_number: get("fathernumber", "father_number", "fathermobile", "fatherphone", "fathercontact", "father_contact") || undefined,
+    tenth_percentage:    tenthRaw   ? parseFloat(tenthRaw)   : undefined,
+    twelfth_percentage:  twelfthRaw ? parseFloat(twelfthRaw) : undefined,
+    cpi:                 cpiRaw     ? parseFloat(cpiRaw)     : undefined,
+    gender:              get("gender", "sex") || undefined,
+    top_label:           topLabel,
+    father_number:       get("fathernumber", "father_number", "fathermobile", "fatherphone", "fathercontact", "father_contact") || undefined,
   };
 }
 
@@ -472,51 +476,118 @@ function normalizeRow(raw: Record<string, any>): StudentRow {
 // ────────────────────────────────────────────────────────────
 function generateInitialPassword(s: StudentRow): string {
   if (s.father_number && s.father_number.length >= 6) return s.father_number;
-  if (s.roll_number && s.name) {
+  if (s.roll_number && s.name)
     return `${s.roll_number}@${s.name.substring(0, 4).toLowerCase()}`;
-  }
   if (s.roll_number) return `${s.roll_number}@utpt`;
   return `${s.college_id}@utpt`;
 }
 
 // ────────────────────────────────────────────────────────────
+// Background auto-sync for a newly imported portal student
+// Fires-and-forgets: does NOT block the HTTP response
+// ────────────────────────────────────────────────────────────
+async function triggerAutoSync(
+  userId: string,
+  s: StudentRow
+): Promise<void> {
+  console.log(`🚀 Auto-sync starting for new student ${userId}`);
+
+  // 1. Coding (LeetCode + Codeforces)
+  if (s.leetcode_username || s.codeforces_username) {
+    try {
+      await syncUserCoding(userId, s.leetcode_username ?? null, s.codeforces_username ?? null);
+      console.log(`✅ Auto-sync coding done for ${userId}`);
+    } catch (err) {
+      console.error(`❌ Auto-sync coding failed for ${userId}:`, err);
+    }
+  }
+
+  // 2. GitHub
+  if (s.github_username) {
+    try {
+      await syncUserGitHub(userId, s.github_username);
+      console.log(`✅ Auto-sync GitHub done for ${userId}`);
+    } catch (err) {
+      console.error(`❌ Auto-sync GitHub failed for ${userId}:`, err);
+    }
+  }
+
+  // 3. Recompute and persist this student's score immediately
+  try {
+    const [codingRes, githubRes, userRes] = await Promise.all([
+      supabase.from("coding_stats").select("*").eq("user_id", userId).single(),
+      supabase.from("github_stats").select("*").eq("user_id", userId).single(),
+      supabase.from("users").select("tenth_percentage, twelfth_percentage, cpi").eq("id", userId).single(),
+    ]);
+
+    const coding = codingRes.data  || {};
+    const github = githubRes.data  || {};
+    const user   = userRes.data    || {};
+
+    const { academicsScore, codingScore, devScore, totalScore } = computeScore(
+      {
+        tenth_percentage:   user.tenth_percentage   ?? null,
+        twelfth_percentage: user.twelfth_percentage ?? null,
+        cpi:                user.cpi                ?? null,
+      },
+      coding,
+      github
+    );
+
+    await supabase.from("scores").upsert(
+      {
+        user_id:         userId,
+        academics_score: academicsScore,
+        coding_score:    codingScore,
+        dev_score:       devScore,
+        total_score:     totalScore,
+        last_computed:   new Date().toISOString(),
+      },
+      { onConflict: "user_id" }
+    );
+
+    console.log(`✅ Auto-sync score updated for ${userId}: ${totalScore}`);
+  } catch (err) {
+    console.error(`❌ Auto-sync score recompute failed for ${userId}:`, err);
+  }
+}
+
+// ────────────────────────────────────────────────────────────
 // Core import logic — used by both JSON and file endpoints
-// Returns summary stats and list of errors
 // ────────────────────────────────────────────────────────────
 async function processStudentImport(students: StudentRow[]) {
-  let portalCount = 0;
+  let portalCount    = 0;
   let analyticsCount = 0;
   const errors: string[] = [];
-  const skipped: string[] = [];
 
   for (const s of students) {
     try {
       const isPortal = s.top_label === 1;
 
       const record: Record<string, any> = {
-        name: s.name,
-        college_id: s.college_id,
-        email: s.email,
-        batch: s.batch,
-        specialization: s.specialization || null,
-        roll_number: s.roll_number || null,
-        leetcode_username: s.leetcode_username || null,
-        github_username: s.github_username || null,
+        name:                s.name,
+        college_id:          s.college_id,
+        email:               s.email,
+        batch:               s.batch,
+        specialization:      s.specialization      || null,
+        roll_number:         s.roll_number         || null,
+        leetcode_username:   s.leetcode_username   || null,
+        github_username:     s.github_username     || null,
         codeforces_username: s.codeforces_username || null,
-        tenth_percentage: s.tenth_percentage ?? null,
-        twelfth_percentage: s.twelfth_percentage ?? null,
-        cpi: s.cpi ?? null,
-        gender: s.gender || null,
-        top_label: s.top_label,
-        role: "student",
-        // Portal students: active & verified; analytics-only: inactive, not verified
-        is_active: isPortal,
-        is_verified: isPortal,
-        force_password_change: isPortal,
+        tenth_percentage:    s.tenth_percentage    ?? null,
+        twelfth_percentage:  s.twelfth_percentage  ?? null,
+        cpi:                 s.cpi                 ?? null,
+        gender:              s.gender              || null,
+        top_label:           s.top_label,
+        role:                "student",
+        // Portal → active + verified; analytics-only → inactive, not verified
+        is_active:              isPortal,
+        is_verified:            isPortal,
+        force_password_change:  isPortal,
       };
 
       if (isPortal) {
-        const rawPassword = generateInitialPassword(s);
+        const rawPassword  = generateInitialPassword(s);
         record.password_hash = await bcrypt.hash(rawPassword, 12);
       }
 
@@ -529,28 +600,38 @@ async function processStudentImport(students: StudentRow[]) {
         continue;
       }
 
-      // Initialize score row for portal students so they appear on leaderboard
-      if (isPortal) {
-        const { data: newUser } = await supabase
-          .from("users")
-          .select("id")
-          .eq("college_id", s.college_id)
-          .single();
+      // Fetch the UUID Postgres assigned so we can use it for sub-tables
+      const { data: newUser } = await supabase
+        .from("users")
+        .select("id")
+        .eq("college_id", s.college_id)
+        .single();
 
-        if (newUser?.id) {
-          // Upsert score row with zeros so they appear on leaderboard immediately
-          await supabase.from("scores").upsert(
-            {
-              user_id: newUser.id,
-              academics_score: 0,
-              coding_score: 0,
-              dev_score: 0,
-              total_score: 0,
-              last_computed: new Date().toISOString(),
-            },
-            { onConflict: "user_id", ignoreDuplicates: false }
-          );
-        }
+      if (!newUser?.id) {
+        errors.push(`${s.college_id}: could not retrieve user id after upsert`);
+        continue;
+      }
+
+      if (isPortal) {
+        // Seed a zero-score row so the student appears on the leaderboard
+        // immediately (will be overwritten when auto-sync completes)
+        await supabase.from("scores").upsert(
+          {
+            user_id:         newUser.id,
+            academics_score: 0,
+            coding_score:    0,
+            dev_score:       0,
+            total_score:     0,
+            last_computed:   new Date().toISOString(),
+          },
+          { onConflict: "user_id", ignoreDuplicates: false }
+        );
+
+        // Fire-and-forget: sync LeetCode + Codeforces + GitHub in background
+        // so real data populates within seconds without blocking the response
+        triggerAutoSync(newUser.id, s).catch((err) =>
+          console.error(`Auto-sync uncaught error for ${newUser.id}:`, err)
+        );
 
         portalCount++;
       } else {
@@ -562,16 +643,20 @@ async function processStudentImport(students: StudentRow[]) {
   }
 
   return {
-    total: students.length,
-    portal_accounts: portalCount,
-    analytics_only: analyticsCount,
-    failed: errors.length,
-    errors: errors.slice(0, 20), // cap at 20 for response size
+    total:            students.length,
+    portal_accounts:  portalCount,
+    analytics_only:   analyticsCount,
+    failed:           errors.length,
+    errors:           errors.slice(0, 20),
+    note:             portalCount > 0
+      ? "LeetCode, Codeforces, and GitHub data is being synced in the background. Scores will update within a minute."
+      : undefined,
   };
 }
 
 // ────────────────────────────────────────────────────────────
 // POST /admin/import-students  (JSON body)
+// Body: { students: StudentRow[] }
 // ────────────────────────────────────────────────────────────
 export const importStudents = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -586,7 +671,7 @@ export const importStudents = async (req: Request, res: Response): Promise<void>
 
     res.status(200).json({
       success: true,
-      data: result,
+      data:    result,
       message: `${result.total} students processed — ${result.portal_accounts} portal accounts created, ${result.analytics_only} analytics-only, ${result.failed} failed`,
     });
   } catch (err) {
@@ -613,7 +698,7 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
       rows = csvParse(text, { columns: true, skip_empty_lines: true, trim: true }) as Record<string, any>[];
     } else if (ext === "xlsx" || ext === "xls") {
       const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const sheet    = workbook.Sheets[workbook.SheetNames[0]];
       rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, { defval: "" });
     } else {
       res.status(400).json({ success: false, data: null, message: "Unsupported file format. Use CSV or Excel (.xlsx/.xls)." });
@@ -630,7 +715,7 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
     // Validate required fields
     const validationErrors: string[] = [];
     students.forEach((s, i) => {
-      const rowNum = i + 2; // +2 because row 1 is header
+      const rowNum = i + 2; // +2 because row 1 is the header
       if (!s.name)       validationErrors.push(`Row ${rowNum}: missing name`);
       if (!s.college_id) validationErrors.push(`Row ${rowNum}: missing college_id / enrollment`);
       if (!s.email)      validationErrors.push(`Row ${rowNum}: missing email`);
@@ -640,7 +725,7 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
     if (validationErrors.length > 0) {
       res.status(400).json({
         success: false,
-        data: { errors: validationErrors.slice(0, 20) },
+        data:    { errors: validationErrors.slice(0, 20) },
         message: `Validation failed for ${validationErrors.length} row(s). Fix and re-upload.`,
       });
       return;
@@ -650,7 +735,7 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
 
     res.status(200).json({
       success: true,
-      data: { ...result, file: req.file.originalname },
+      data:    { ...result, file: req.file.originalname },
       message: `${result.total} students imported from ${req.file.originalname} — ${result.portal_accounts} portal accounts, ${result.analytics_only} analytics-only, ${result.failed} failed`,
     });
   } catch (err) {
@@ -661,9 +746,11 @@ export const importStudentsFromFile = async (req: Request, res: Response): Promi
 
 // ────────────────────────────────────────────────────────────
 // PUT /admin/students/:id/toggle-active
-// Enables or disables a portal student's account.
-// This does NOT affect top_label — the student still has portal access,
-// they just can't log in while is_active=false (suspended/banned).
+//
+// Enables or disables a portal student's login.
+// - Only works on portal students (top_label = 1).
+// - Disabled students keep their data; they simply cannot log in.
+// - Does NOT change top_label.
 // ────────────────────────────────────────────────────────────
 export const toggleStudentActive = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -680,12 +767,11 @@ export const toggleStudentActive = async (req: Request, res: Response): Promise<
       return;
     }
 
-    // Only portal students can be toggled (analytics-only have no login anyway)
     if (user.top_label !== 1) {
       res.status(400).json({
         success: false,
-        data: null,
-        message: "This student has no portal access. Only portal students (top_label=1) can be enabled/disabled.",
+        data:    null,
+        message: "This student has no portal access (analytics-only). Only portal students can be enabled/disabled.",
       });
       return;
     }
@@ -701,8 +787,8 @@ export const toggleStudentActive = async (req: Request, res: Response): Promise<
 
     res.status(200).json({
       success: true,
-      data: updated,
-      message: `Student "${user.name}" ${newActiveState ? "enabled (can now log in)" : "disabled (login blocked)"}`,
+      data:    updated,
+      message: `Student "${user.name}" ${newActiveState ? "enabled — can now log in" : "disabled — login blocked"}`,
     });
   } catch (err) {
     console.error("toggleStudentActive error:", err);
@@ -723,8 +809,8 @@ export const getActivityAnalytics = async (req: Request, res: Response): Promise
       { $match: { date: { $gte: sinceStr }, total_solved: { $gt: 0 } } },
       {
         $group: {
-          _id: "$date",
-          count: { $sum: 1 },
+          _id:         "$date",
+          count:       { $sum: 1 },
           totalSolves: { $sum: "$total_solved" },
         },
       },
@@ -774,12 +860,12 @@ export const createTrainer = async (req: Request, res: Response): Promise<void> 
         name,
         email,
         college_id,
-        password_hash: passwordHash,
-        role: "trainer",
-        is_active: true,
-        is_verified: true,
+        password_hash:         passwordHash,
+        role:                  "trainer",
+        is_active:             true,
+        is_verified:           true,
         force_password_change: false,
-        top_label: 1, // Trainers always have portal access
+        top_label:             1,
       })
       .select("id, name, email, college_id, role")
       .single();
@@ -806,7 +892,7 @@ export const searchStudentByEmail = async (req: Request, res: Response): Promise
     if (!q && !email && !name && !college_id && !batch) {
       res.status(400).json({
         success: false,
-        data: null,
+        data:    null,
         message: "Provide at least one search parameter: q, email, name, college_id, or batch",
       });
       return;
@@ -843,10 +929,10 @@ export const searchStudentByEmail = async (req: Request, res: Response): Promise
 
     res.status(200).json({
       success: true,
-      data: (students || []).map(s => ({
+      data: (students || []).map((s) => ({
         ...s,
         has_portal_access: s.top_label === 1,
-        account_status: s.is_active ? "active" : "disabled",
+        account_status:    s.is_active ? "active" : "disabled",
       })),
       message: `${(students || []).length} result(s) found`,
     });
@@ -893,10 +979,10 @@ export const getBatchAnalytics = async (req: Request, res: Response): Promise<vo
       supabase.from("coding_stats").select("user_id, lc_total_solved, cf_rating").in("user_id", studentIds),
     ]);
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today      = new Date().toISOString().slice(0, 10);
     const activeToday = await DailySolveLog.countDocuments({
-      user_id: { $in: studentIds },
-      date: today,
+      user_id:      { $in: studentIds },
+      date:         today,
       total_solved: { $gt: 0 },
     });
 
@@ -951,16 +1037,16 @@ export const getBatchAnalytics = async (req: Request, res: Response): Promise<vo
       success: true,
       data: {
         batch,
-        total_students:         students.length,
-        portal_students:        portalCount,
-        analytics_only:         students.length - portalCount,
-        active_today:           activeToday,
-        avg_score:              scores.length > 0 ? Math.round(totalScore / scores.length) : 0,
-        avg_lc_solved:          avgLcSolved,
-        avg_cf_rating:          avgCfRating,
-        score_distribution:     distribution,
+        total_students:           students.length,
+        portal_students:          portalCount,
+        analytics_only:           students.length - portalCount,
+        active_today:             activeToday,
+        avg_score:                scores.length > 0 ? Math.round(totalScore / scores.length) : 0,
+        avg_lc_solved:            avgLcSolved,
+        avg_cf_rating:            avgCfRating,
+        score_distribution:       distribution,
         specialization_breakdown: Object.entries(specMap).map(([spec, count]) => ({ spec, count })),
-        top_performers:         topPerformers,
+        top_performers:           topPerformers,
       },
       message: `Batch ${batch} analytics fetched`,
     });
@@ -979,27 +1065,27 @@ export const getGrowthAnalytics = async (req: Request, res: Response): Promise<v
       { $match: { total_solved: { $gt: 0 } } },
       {
         $addFields: {
-          week: { $isoWeek: { $toDate: "$date" } },
+          week: { $isoWeek:     { $toDate: "$date" } },
           year: { $isoWeekYear: { $toDate: "$date" } },
         },
       },
       {
         $group: {
-          _id: { week: "$week", year: "$year" },
-          solves: { $sum: "$total_solved" },
+          _id:         { week: "$week", year: "$year" },
+          solves:      { $sum: "$total_solved" },
           activeUsers: { $addToSet: "$user_id" },
         },
       },
       {
         $project: {
-          week: "$_id.week",
-          year: "$_id.year",
-          solves: 1,
+          week:        "$_id.week",
+          year:        "$_id.year",
+          solves:      1,
           activeUsers: { $size: "$activeUsers" },
-          _id: 0,
+          _id:         0,
         },
       },
-      { $sort: { year: 1, week: 1 } },
+      { $sort:  { year: 1, week: 1 } },
       { $limit: 12 },
     ]);
 
